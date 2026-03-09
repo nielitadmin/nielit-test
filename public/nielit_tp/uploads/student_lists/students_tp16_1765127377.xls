@@ -1,0 +1,26 @@
+<table border="1"><thead><tr>
+        <th>ID</th>
+        <th>Full Name</th>
+        <th>Father Name</th>
+        <th>Gender</th>
+        <th>Aadhar</th>
+        <th>Category</th>
+        <th>Email</th>
+        <th>Phone</th>
+        <th>City</th>
+        <th>District</th>
+        <th>State</th>
+        <th>Center</th>
+        <th>Course</th>
+        <th>Course Other</th>
+        <th>Completion Date</th>
+        <th>Qualification</th>
+        <th>Qualification Other</th>
+        <th>Pass Year</th>
+        <th>Skills</th>
+        <th>Exp (Years)</th>
+        <th>Exp Description</th>
+        <th>Salary Expectation</th>
+        <th>Resume File</th>
+        <th>Registered At</th>
+      </tr></thead><tbody><tr><td>11</td><td>Kumar Dinesh Behera</td><td>Ajaya Kumar Behera</td><td>Male</td><td>'217160844401</td><td>OBC</td><td>kumardineshbehera123@gmail.com</td><td>+919078877623</td><td>Jajpur</td><td>Chhatia</td><td>Odisha</td><td>NIELIT Bhubaneswar</td><td>NIELIT O-LEVEL(IT)</td><td></td><td>2024-02</td><td>Graduation</td><td></td><td>2000</td><td>Cyber Security</td><td>11</td><td>Good Work</td><td>40-50K, 50K+</td><td>1765044873_2394526717c5.pdf</td><td>2025-12-06 18:14:33</td></tr></tbody></table>

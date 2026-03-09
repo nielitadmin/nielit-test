@@ -1,0 +1,661 @@
+<?php
+// admin_dashboard.php
+// Premium organized admin dashboard (single-file)
+// Requirements: includes/db_connect.php, includes/functions.php, includes/header.php, includes/footer.php
+//
+// Notes:
+// - Move SMTP creds to env in production.
+// - functions.php is responsible for loading PHPMailer and defining send_smtp_email()
+// - Ensure includes do not produce output before session_start().
+
+if (!session_id()) session_start();
+ob_start();
+
+// Development error reporting (turn off in production)
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+error_reporting(E_ALL);
+
+// --- INCLUDES ---
+// db_connect.php must provide $pdo (PDO)
+// includes/functions.php must provide require_login_admin(), redirect(), send_smtp_email(), etc.
+// NOTE: functions.php is responsible for loading vendor/autoload.php and PHPMailer, so DO NOT require autoload here.
+require_once __DIR__ . '/includes/db_connect.php';
+require_once __DIR__ . '/includes/functions.php';
+
+// Optional: import PHPMailer classes for IDE type-hinting only (do NOT re-require autoload).
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\Exception;
+
+$page_title = 'Admin Dashboard';
+require_login_admin(); // guard: ensures only admin reaches this page
+
+// --- FETCH STATS (safe) ---
+$msg = '';
+try {
+    $total_tps = (int)$pdo->query("SELECT COUNT(*) FROM tps")->fetchColumn();
+    $total_subs = (int)$pdo->query("SELECT COUNT(*) FROM submissions")->fetchColumn();
+    $total_students = (int)$pdo->query("SELECT COALESCE(SUM(total_students),0) FROM submissions")->fetchColumn();
+    $total_revenue = (float)$pdo->query("SELECT COALESCE(SUM(total_amount),0) FROM submissions WHERE payment_status='paid'")->fetchColumn();
+} catch (\Throwable $e) {
+    error_log("Dashboard stats error: " . $e->getMessage());
+    $total_tps = $total_subs = $total_students = 0;
+    $total_revenue = 0.0;
+}
+
+// --- FETCH TP LISTS ---
+try {
+    $pending_raw = $pdo->query('SELECT * FROM tps WHERE verified="pending" ORDER BY id DESC')->fetchAll(PDO::FETCH_ASSOC);
+    $registered_raw = $pdo->query('SELECT * FROM tps WHERE verified IN ("approved","rejected") ORDER BY id DESC')->fetchAll(PDO::FETCH_ASSOC);
+} catch (\Throwable $e) {
+    error_log("TP list fetch error: " . $e->getMessage());
+    $pending_raw = $registered_raw = [];
+}
+
+// Per-TP totals prepared statement
+$totStmt = $pdo->prepare("SELECT 
+    COALESCE(SUM(total_students),0) AS tp_total_students,
+    COALESCE(SUM(CASE WHEN payment_status='paid' THEN total_amount ELSE 0 END),0) AS tp_total_paid
+  FROM submissions WHERE tp_id = :id");
+
+// Attach totals to TP rows
+$pending = [];
+foreach ($pending_raw as $tp) {
+    $totStmt->execute(['id' => $tp['id']]);
+    $t = $totStmt->fetch(PDO::FETCH_ASSOC);
+    $tp['tp_total_students'] = (int)($t['tp_total_students'] ?? 0);
+    $tp['tp_total_paid'] = (float)($t['tp_total_paid'] ?? 0.0);
+    $pending[] = $tp;
+}
+
+$registered = [];
+foreach ($registered_raw as $tp) {
+    $totStmt->execute(['id' => $tp['id']]);
+    $t = $totStmt->fetch(PDO::FETCH_ASSOC);
+    $tp['tp_total_students'] = (int)($t['tp_total_students'] ?? 0);
+    $tp['tp_total_paid'] = (float)($t['tp_total_paid'] ?? 0.0);
+    $registered[] = $tp;
+}
+
+// --- EXAMS & SUBMISSIONS ---
+try {
+    $exams = $pdo->query('SELECT * FROM exams ORDER BY exam_date DESC')->fetchAll(PDO::FETCH_ASSOC);
+    $submissions = $pdo->query('
+        SELECT s.*, s.id AS submission_id, s.created_at AS applied_on,
+               e.title AS exam_title, e.exam_date,
+               t.centre_name AS tp_name, t.username AS tp_username, t.email AS tp_email
+        FROM submissions s
+        JOIN exams e ON s.exam_id = e.id
+        JOIN tps t ON s.tp_id = t.id
+        ORDER BY s.created_at DESC
+    ')->fetchAll(PDO::FETCH_ASSOC);
+} catch (\Throwable $e) {
+    error_log("Exams/Submissions fetch error: " . $e->getMessage());
+    $exams = $submissions = [];
+}
+
+// --- ACTION HANDLER ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['action'])) {
+    $action = $_POST['action'];
+
+    // Approve TP
+    if ($action === 'approve_tp' && !empty($_POST['tp_id'])) {
+        $tp_id = intval($_POST['tp_id']);
+        $pdo->prepare('UPDATE tps SET verified="approved", verified_at = NOW() WHERE id = :id')->execute(['id' => $tp_id]);
+
+        $stmt = $pdo->prepare('SELECT email, centre_name FROM tps WHERE id = :id LIMIT 1');
+        $stmt->execute(['id' => $tp_id]);
+        $tp = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($tp && !empty($tp['email'])) {
+            $subject = "Your Training Partner account has been approved";
+            $body = "<p>Dear ".htmlspecialchars($tp['centre_name']).",</p>
+                     <p>Your Training Partner account has been <strong>approved</strong>. You can now login and apply for mock exams.</p>
+                     <p>Regards,<br/>NIELIT Mock Exams Team</p>";
+            // use send_smtp_email defined in includes/functions.php
+            send_smtp_email($tp['email'], $tp['centre_name'], $subject, $body);
+        }
+
+        $_SESSION['flash_msg'] = '✅ TP approved.';
+        header('Location: admin_dashboard.php'); exit;
+    }
+
+    // Reject TP
+    if ($action === 'reject_tp' && !empty($_POST['tp_id'])) {
+        $tp_id = intval($_POST['tp_id']);
+        $pdo->prepare('UPDATE tps SET verified="rejected" WHERE id = :id')->execute(['id' => $tp_id]);
+
+        $stmt = $pdo->prepare('SELECT email, centre_name FROM tps WHERE id = :id LIMIT 1');
+        $stmt->execute(['id' => $tp_id]);
+        $tp = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($tp && !empty($tp['email'])) {
+            $subject = "Your Training Partner application has been rejected";
+            $body = "<p>Dear ".htmlspecialchars($tp['centre_name']).",</p>
+                     <p>We are sorry to inform you that your Training Partner registration has been <strong>rejected</strong>. Please contact admin for details.</p>
+                     <p>Regards,<br/>NIELIT Mock Exams Team</p>";
+            send_smtp_email($tp['email'], $tp['centre_name'], $subject, $body);
+        }
+
+        $_SESSION['flash_msg'] = '❌ TP rejected.';
+        header('Location: admin_dashboard.php'); exit;
+    }
+
+    // Delete TP
+    if ($action === 'delete_tp' && !empty($_POST['tp_id'])) {
+        $tp_id = intval($_POST['tp_id']);
+        $pdo->prepare('DELETE FROM tps WHERE id = :id')->execute(['id' => $tp_id]);
+        $_SESSION['flash_msg'] = '🗑 TP deleted.';
+        header('Location: admin_dashboard.php'); exit;
+    }
+
+    // Create exam
+    if ($action === 'create_exam') {
+        $title = trim($_POST['title'] ?? '');
+        $exam_date = $_POST['exam_date'] ?? null;
+        $price = floatval($_POST['price'] ?? 0);
+        if ($title && $exam_date) {
+            $pdo->prepare('INSERT INTO exams (title, exam_date, price_per_student, is_active) VALUES (:t,:d,:p,1)')
+                ->execute(['t'=>$title,'d'=>$exam_date,'p'=>$price]);
+            $_SESSION['flash_msg'] = '🧾 Exam created & activated.';
+        } else {
+            $_SESSION['flash_msg'] = '⚠️ Provide valid title and date.';
+        }
+        header('Location: admin_dashboard.php'); exit;
+    }
+
+    // Toggle exam
+    if ($action === 'toggle_exam' && !empty($_POST['exam_id'])) {
+        $id = intval($_POST['exam_id']);
+        $new_state = intval($_POST['new_state']);
+        $pdo->prepare('UPDATE exams SET is_active = :s WHERE id = :id')->execute(['s'=>$new_state,'id'=>$id]);
+        $_SESSION['flash_msg'] = $new_state ? '✅ Exam activated.' : '⚪ Exam deactivated.';
+        header('Location: admin_dashboard.php'); exit;
+    }
+
+    // Delete exam
+    if ($action === 'delete_exam' && !empty($_POST['exam_id'])) {
+        $id = intval($_POST['exam_id']);
+        $pdo->prepare('DELETE FROM exams WHERE id = :id')->execute(['id'=>$id]);
+        $_SESSION['flash_msg'] = '🗑 Exam deleted.';
+        header('Location: admin_dashboard.php'); exit;
+    }
+
+    // Approve payment
+    if ($action === 'approve_payment' && !empty($_POST['submission_id'])) {
+        $submission_id = intval($_POST['submission_id']);
+        $pdo->prepare('UPDATE submissions SET payment_status = "paid", paid_at = NOW() WHERE id = :id')->execute(['id' => $submission_id]);
+
+        $q = $pdo->prepare('SELECT s.total_amount, s.batch_name, t.email, t.centre_name FROM submissions s JOIN tps t ON s.tp_id = t.id WHERE s.id = :id LIMIT 1');
+        $q->execute(['id' => $submission_id]);
+        $row = $q->fetch(PDO::FETCH_ASSOC);
+        if ($row && !empty($row['email'])) {
+                if ($action === 'approve_payment' && !empty($_POST['submission_id'])) {
+        $submission_id = intval($_POST['submission_id']);
+        $pdo->prepare('UPDATE submissions SET payment_status = "paid", paid_at = NOW() WHERE id = :id')
+            ->execute(['id' => $submission_id]);
+    
+        // Fetch TP data
+        $q = $pdo->prepare('
+            SELECT 
+                s.total_amount, 
+                s.batch_name, 
+                s.paid_at,
+                t.email, 
+                t.centre_name 
+            FROM submissions s 
+            JOIN tps t ON s.tp_id = t.id 
+            WHERE s.id = :id 
+            LIMIT 1
+        ');
+        $q->execute(['id' => $submission_id]);
+        $row = $q->fetch(PDO::FETCH_ASSOC);
+    
+        if ($row && !empty($row['email'])) {
+    
+            // Format Date (DD/MM/YYYY HH:MM)
+            $payDate = date('d/m/Y H:i', strtotime($row['paid_at']));
+    
+            $subject = "Payment Received Successfully";
+    
+            $body = "
+                <p>Dear <strong>".htmlspecialchars($row['centre_name'])."</strong>,</p>
+    
+                <p>
+                    NIELIT Bhubaneswar has successfully 
+                    <strong>received your payment</strong> of 
+                    <strong>₹".number_format($row['total_amount'],2)."</strong>
+                    on <strong>$payDate</strong>.
+                </p>
+    
+                <p>
+                    Batch Name: <strong>".htmlspecialchars($row['batch_name'])."</strong><br>
+                    TPS Portal Submission ID: <strong>$submission_id</strong>
+                </p>
+    
+                <p>Your payment has been verified and your submission is now processed.</p>
+    
+                <p>Regards,<br>
+                <strong>NIELIT Bhubaneswar</strong></p>
+            ";
+    
+            // Correct function call (only 3 arguments)
+            send_smtp_email($row['email'], $subject, $body);
+        }
+    
+        $_SESSION['flash_msg'] = '✔ Payment approved and TP notified.';
+        header('Location: admin_dashboard.php');
+        exit;
+    }
+
+        }
+
+        $_SESSION['flash_msg'] = '✔ Payment approved and TP notified.';
+        header('Location: admin_dashboard.php'); exit;
+    }
+
+    // Reject payment
+    if ($action === 'reject_payment' && !empty($_POST['submission_id'])) {
+        $submission_id = intval($_POST['submission_id']);
+        $pdo->prepare('UPDATE submissions SET payment_status = "receipt_rejected" WHERE id = :id')->execute(['id' => $submission_id]);
+
+        $q = $pdo->prepare('SELECT s.total_amount, s.batch_name, t.email, t.centre_name FROM submissions s JOIN tps t ON s.tp_id = t.id WHERE s.id = :id LIMIT 1');
+        $q->execute(['id' => $submission_id]);
+        $row = $q->fetch(PDO::FETCH_ASSOC);
+        if ($row && !empty($row['email'])) {
+            $subject = "Payment receipt rejected — please reupload";
+            $body = "<p>Dear ".htmlspecialchars($row['centre_name']).",</p>
+                     <p>The payment receipt you uploaded for batch <strong>".htmlspecialchars($row['batch_name'])."</strong> amounting to <strong>₹".number_format($row['total_amount'],2)."</strong> was <strong>rejected</strong> during verification. Please upload a clear receipt/screenshot again from your TP dashboard.</p>
+                     <p>Regards,<br/>NIELIT Mock Exams Team</p>";
+            send_smtp_email($row['email'], $row['centre_name'], $subject, $body);
+        }
+
+        $_SESSION['flash_msg'] = '❌ Receipt rejected and TP notified.';
+        header('Location: admin_dashboard.php'); exit;
+    }
+}
+
+// --- FLASH ---
+if (!empty($_SESSION['flash_msg'])) {
+    $msg = $_SESSION['flash_msg'];
+    unset($_SESSION['flash_msg']);
+}
+
+// --- INCLUDE HEADER ---
+include __DIR__ . '/includes/header.php';
+?>
+
+<!-- Hybrid CSS: Tailwind + Bootstrap -->
+<link href="https://cdn.jsdelivr.net/npm/tailwindcss@3.4.8/dist/tailwind.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer" />
+
+<div class="container-fluid px-4 py-5">
+  <div class="d-flex justify-content-between align-items-center mb-4">
+    <h1 class="display-5 fw-bold text-slate-800"><?= htmlspecialchars($page_title) ?></h1>
+    <div class="d-flex gap-2">
+      <form method="post" action="logout.php">
+        <button type="submit" class="btn btn-danger btn-lg">
+          <i class="fa-solid fa-right-from-bracket"></i> Logout
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <?php if (!empty($msg)): ?>
+    <div class="alert alert-info rounded-3 py-3 mb-4"><?= htmlspecialchars($msg) ?></div>
+  <?php endif; ?>
+
+  <!-- Summary cards -->
+  <div class="row g-4 mb-5">
+    <?php
+      $cards = [
+        ['title'=>'Total TPs','value'=>$total_tps,'icon'=>'fa-building-columns','color'=>'text-primary','desc'=>'All registered training partners'],
+        ['title'=>'Total Submissions','value'=>$total_subs,'icon'=>'fa-file-signature','color'=>'text-indigo-600','desc'=>'All submissions across exams'],
+        ['title'=>'Total Students','value'=>$total_students,'icon'=>'fa-user-group','color'=>'text-emerald-600','desc'=>'Cumulative students applied'],
+        ['title'=>'Total Revenue','value'=>'₹'.number_format($total_revenue,2),'icon'=>'fa-indian-rupee-sign','color'=>'text-amber-600','desc'=>'Collected from verified payments']
+      ];
+    ?>
+    <?php foreach ($cards as $c): ?>
+      <div class="col-12 col-md-6 col-lg-3">
+        <div class="card shadow-sm h-100 border-0">
+          <div class="card-body">
+            <div class="d-flex justify-content-between align-items-start">
+              <div>
+                <h6 class="text-muted"><?= $c['title'] ?></h6>
+                <h2 class="fw-bold display-6 <?= $c['color'] ?>"><?= $c['value'] ?></h2>
+              </div>
+              <div class="fs-2 <?= $c['color'] ?>"><i class="fa-solid <?= $c['icon'] ?>"></i></div>
+            </div>
+            <p class="mb-0 text-muted small mt-2"><?= $c['desc'] ?></p>
+          </div>
+        </div>
+      </div>
+    <?php endforeach; ?>
+  </div>
+
+  <div class="row gx-4 gy-4">
+    <!-- LEFT: TPs -->
+    <div class="col-12 col-lg-4">
+      <!-- Pending -->
+      <div class="card shadow-sm mb-4">
+        <div class="card-header bg-white d-flex justify-content-between align-items-center">
+          <h5 class="mb-0">Pending TPs <span class="badge bg-secondary"><?= count($pending) ?></span></h5>
+        </div>
+        <div class="card-body" style="max-height:520px; overflow:auto;">
+          <?php if (empty($pending)): ?>
+            <div class="text-muted">No pending registrations.</div>
+          <?php else: foreach ($pending as $p): ?>
+            <div class="d-flex align-items-start justify-content-between mb-3 p-3 border rounded bg-light">
+              <div class="me-3 flex-grow-1">
+                <div class="fw-semibold fs-5"><?= htmlspecialchars($p['centre_name']) ?></div>
+                <div class="text-muted small"><?= htmlspecialchars($p['username']) ?> • <?= htmlspecialchars($p['email']) ?></div>
+                <div class="text-muted small mt-2">Applied students: <strong><?= $p['tp_total_students'] ?></strong> • Paid: <strong>₹<?= number_format($p['tp_total_paid'],2) ?></strong></div>
+              </div>
+
+              <div class="d-flex flex-column align-items-end gap-2">
+                <button onclick="openTPDetails('<?= htmlspecialchars(base64_encode(json_encode($p)), ENT_QUOTES) ?>')" class="btn btn-outline-primary btn-sm">Details</button>
+
+                <div class="d-flex gap-1">
+                  <form method="post">
+                    <input type="hidden" name="tp_id" value="<?= $p['id'] ?>">
+                    <button name="action" value="approve_tp" class="btn btn-success btn-sm">Approve</button>
+                  </form>
+
+                  <form method="post">
+                    <input type="hidden" name="tp_id" value="<?= $p['id'] ?>">
+                    <button name="action" value="reject_tp" class="btn btn-warning btn-sm">Reject</button>
+                  </form>
+                </div>
+              </div>
+            </div>
+          <?php endforeach; endif; ?>
+        </div>
+      </div>
+
+      <!-- Registered -->
+      <div class="card shadow-sm">
+        <div class="card-header bg-white d-flex justify-content-between align-items-center">
+          <h5 class="mb-0">Registered TPs <span class="badge bg-secondary"><?= count($registered) ?></span></h5>
+        </div>
+        <div class="card-body" style="max-height:420px; overflow:auto;">
+          <?php if (empty($registered)): ?>
+            <div class="text-muted">No registered TPs.</div>
+          <?php else: foreach ($registered as $tp): ?>
+            <div class="d-flex align-items-center justify-content-between mb-3 p-3 border rounded bg-light">
+              <div>
+                <div class="fw-semibold"><?= htmlspecialchars($tp['centre_name']) ?></div>
+                <div class="text-muted small"><?= htmlspecialchars($tp['username']) ?> • <?= htmlspecialchars($tp['email']) ?></div>
+                <div class="text-muted small mt-1">Students: <strong><?= $tp['tp_total_students'] ?></strong> • Paid: <strong>₹<?= number_format($tp['tp_total_paid'],2) ?></strong></div>
+              </div>
+
+              <div class="d-flex gap-2">
+                <button onclick="openTPDetails('<?= htmlspecialchars(base64_encode(json_encode($tp)), ENT_QUOTES) ?>')" class="btn btn-outline-primary btn-sm">Details</button>
+
+                <form method="post" onsubmit="return confirm('Delete this TP? This action cannot be undone.');">
+                  <input type="hidden" name="tp_id" value="<?= $tp['id'] ?>">
+                  <input type="hidden" name="action" value="delete_tp">
+                  <button class="btn btn-outline-danger btn-sm">🗑 Delete</button>
+                </form>
+              </div>
+            </div>
+          <?php endforeach; endif; ?>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: Exams & Submissions -->
+    <div class="col-12 col-lg-8">
+      <!-- Exams -->
+      <div class="card shadow-sm mb-4">
+        <div class="card-header bg-white d-flex justify-content-between align-items-center">
+          <h5 class="mb-0">Exams</h5>
+        </div>
+
+        <div class="card-body">
+          <form method="post" class="row g-3 align-items-end mb-3">
+            <input type="hidden" name="action" value="create_exam">
+            <div class="col-12 col-md-5">
+              <label class="form-label small text-muted">Title</label>
+              <input name="title" class="form-control form-control-lg" required>
+            </div>
+            <div class="col-12 col-md-4">
+              <label class="form-label small text-muted">Exam Date</label>
+              <input name="exam_date" type="datetime-local" class="form-control form-control-lg" required>
+            </div>
+            <div class="col-12 col-md-3">
+              <label class="form-label small text-muted">Price / student (₹)</label>
+              <input name="price" type="number" step="0.01" class="form-control form-control-lg" required>
+            </div>
+            <div class="col-12">
+              <button class="btn btn-primary btn-lg">Create & Activate</button>
+            </div>
+          </form>
+
+          <div class="list-group">
+            <?php if (empty($exams)): ?>
+              <div class="text-muted small">No exams created yet.</div>
+            <?php else: foreach ($exams as $e): ?>
+              <div class="list-group-item d-flex justify-content-between align-items-center">
+                <div>
+                  <div class="fw-semibold"><?= htmlspecialchars($e['title']) ?></div>
+                  <div class="text-muted small"><?= date('d M Y, H:i', strtotime($e['exam_date'])) ?> — ₹<?= number_format($e['price_per_student'],2) ?></div>
+                </div>
+
+                <div class="d-flex gap-2 align-items-center">
+                  <form method="post" class="d-inline-block">
+                    <input type="hidden" name="exam_id" value="<?= $e['id'] ?>">
+                    <input type="hidden" name="new_state" value="<?= $e['is_active'] ? 0 : 1 ?>">
+                    <button name="action" value="toggle_exam" class="btn btn-outline-secondary btn-sm">
+                      <?= $e['is_active'] ? 'Deactivate' : 'Activate' ?>
+                    </button>
+                  </form>
+
+                  <form method="post" class="d-inline-block" onsubmit="return confirm('Delete this exam?');">
+                    <input type="hidden" name="exam_id" value="<?= $e['id'] ?>">
+                    <button name="action" value="delete_exam" class="btn btn-outline-danger btn-sm">🗑</button>
+                  </form>
+                </div>
+              </div>
+            <?php endforeach; endif; ?>
+          </div>
+        </div>
+      </div>
+
+      <!-- Submissions -->
+      <div class="card shadow-sm">
+        <div class="card-header bg-white d-flex justify-content-between align-items-center">
+          <h5 class="mb-0">Payment Verification & Submissions</h5>
+          <span class="text-muted small"><?= count($submissions) ?> records</span>
+        </div>
+
+        <div class="card-body">
+          <?php if (empty($submissions)): ?>
+            <div class="text-muted">No submissions found.</div>
+          <?php else: ?>
+            <div class="table-responsive-lg">
+              <table class="table table-hover align-middle table-bordered" style="min-width:1200px;">
+                <thead class="table-dark">
+                  <tr>
+                    <th>#</th>
+                    <th>TP</th>
+                    <th>Exam</th>
+                    <th>Batch</th>
+                    <th class="text-end">Students</th>
+                    <th class="text-end">Amount</th>
+                    <th>Status</th>
+                    <th class="text-center">Student File</th>
+                    <th class="text-center">Receipt</th>
+                    <th>Action</th>
+                    <th>Applied On</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <?php $i = 1; foreach ($submissions as $s):
+                    $rowClass = ($s['payment_status'] === 'paid') ? 'table-success' :
+                                (($s['payment_status'] === 'receipt_uploaded') ? 'table-warning' : 'table-danger');
+                  ?>
+                    <tr class="<?= $rowClass ?>">
+                      <td style="width:40px;"><?= $i++ ?></td>
+                      <td>
+                        <div class="fw-semibold"><?= htmlspecialchars($s['tp_name']) ?></div>
+                        <div class="text-muted small"><?= htmlspecialchars($s['tp_username']) ?></div>
+                      </td>
+                      <td>
+                        <div><?= htmlspecialchars($s['exam_title']) ?></div>
+                        <div class="text-muted small"><?= date('d M Y', strtotime($s['exam_date'])) ?></div>
+                      </td>
+                      <td><?= htmlspecialchars($s['batch_name']) ?></td>
+                      <td class="text-end"><?= (int)$s['total_students'] ?></td>
+                      <td class="text-end">₹<?= number_format($s['total_amount'],2) ?></td>
+                      <td>
+                        <?php
+                          if ($s['payment_status'] === 'paid') echo "<span class='badge bg-success text-white'>PAID</span>";
+                          elseif ($s['payment_status'] === 'receipt_uploaded') echo "<span class='badge bg-warning text-dark'>RECEIPT UPLOADED</span>";
+                          elseif ($s['payment_status'] === 'receipt_rejected') echo "<span class='badge bg-danger text-white'>REJECTED</span>";
+                          else echo "<span class='badge bg-secondary text-white'>PENDING</span>";
+                        ?>
+                      </td>
+                      <td class="text-center">
+                        <?php if (!empty($s['upload_filename']) && file_exists(__DIR__ . '/' . $s['upload_filename'])): ?>
+                          <a href="<?= htmlspecialchars($s['upload_filename']) ?>" download class="btn btn-sm btn-outline-primary">Download</a>
+                        <?php else: ?>
+                          <span class="text-muted small">N/A</span>
+                        <?php endif; ?>
+                      </td>
+                      <td class="text-center">
+                        <?php if (!empty($s['payment_receipt']) && file_exists(__DIR__ . '/' . $s['payment_receipt'])): ?>
+                          <a href="<?= htmlspecialchars($s['payment_receipt']) ?>" target="_blank" class="btn btn-sm btn-outline-success">View</a>
+                        <?php else: ?>
+                          <span class="text-muted small">N/A</span>
+                        <?php endif; ?>
+                      </td>
+                      <td style="min-width:220px;">
+                        <?php if ($s['payment_status'] === 'receipt_uploaded'): ?>
+                          <div class="d-flex gap-2">
+                            <form method="post" onsubmit="return confirm('Mark payment as received and notify TP?');" class="d-inline">
+                              <input type="hidden" name="action" value="approve_payment">
+                              <input type="hidden" name="submission_id" value="<?= (int)$s['submission_id'] ?>">
+                              <button class="btn btn-success btn-sm">Approve</button>
+                            </form>
+
+                            <form method="post" onsubmit="return confirm('Reject the receipt and request reupload?');" class="d-inline">
+                              <input type="hidden" name="action" value="reject_payment">
+                              <input type="hidden" name="submission_id" value="<?= (int)$s['submission_id'] ?>">
+                              <button class="btn btn-danger btn-sm">Reject</button>
+                            </form>
+                          </div>
+                        <?php elseif ($s['payment_status'] === 'paid'): ?>
+                          <span class="text-success fw-semibold">✔ Verified</span>
+                        <?php elseif ($s['payment_status'] === 'receipt_rejected'): ?>
+                          <span class="text-danger fw-semibold">Rejected</span>
+                        <?php else: ?>
+                          <span class="text-muted small">Waiting Receipt</span>
+                        <?php endif; ?>
+                      </td>
+                      <td><?= date('d M Y, H:i', strtotime($s['applied_on'])) ?></td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+          <?php endif; ?>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- TP Details Modal -->
+<div class="modal fade" id="tpDetailsModal" tabindex="-1" aria-labelledby="tpDetailsModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header bg-primary text-white">
+        <h5 class="modal-title" id="tpDetailsModalLabel">Training Partner Details</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div id="tpDetailsContent" class="fs-6 text-slate-700">
+          <p><strong>Centre Name:</strong> <span id="tp_centre">-</span></p>
+          <p><strong>Accreditation No:</strong> <span id="tp_accr">-</span></p>
+          <p><strong>Username:</strong> <span id="tp_user">-</span></p>
+          <p><strong>Email:</strong> <span id="tp_email">-</span></p>
+          <p><strong>Contact:</strong> <span id="tp_contact">-</span></p>
+          <p><strong>Location:</strong> <span id="tp_location">-</span></p>
+          <p><strong>Pincode:</strong> <span id="tp_pincode">-</span></p>
+          <p><strong>In-charge:</strong> <span id="tp_incharge">-</span></p>
+          <hr>
+          <p><strong>Total Students Applied:</strong> <span id="tp_total_students">0</span></p>
+          <p><strong>Total Amount Paid:</strong> ₹<span id="tp_total_paid">0.00</span></p>
+          <p><strong>Status:</strong> <span id="tp_status">-</span></p>
+          <p><strong>Verified At:</strong> <span id="tp_verified">-</span></p>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <form id="modalApproveForm" method="post" class="me-auto">
+          <input type="hidden" name="tp_id" id="modal_tp_id" value="">
+          <input type="hidden" name="action" value="approve_tp">
+          <button type="submit" class="btn btn-success">Approve</button>
+        </form>
+
+        <form id="modalRejectForm" method="post" class="me-2">
+          <input type="hidden" name="tp_id" id="modal_tp_id_rej" value="">
+          <input type="hidden" name="action" value="reject_tp">
+          <button type="submit" class="btn btn-warning">Reject</button>
+        </form>
+
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Scripts -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+function openTPDetails(b64) {
+    try {
+        const raw = atob(b64);
+        const data = JSON.parse(raw);
+
+        document.getElementById('tp_centre').textContent = data.centre_name || '-';
+        document.getElementById('tp_accr').textContent = data.accreditation_no || '-';
+        document.getElementById('tp_user').textContent = data.username || '-';
+        document.getElementById('tp_email').textContent = data.email || '-';
+        document.getElementById('tp_contact').textContent = data.contact_number || '-';
+        document.getElementById('tp_location').textContent = data.location || '-';
+        document.getElementById('tp_pincode').textContent = data.pincode || '-';
+        document.getElementById('tp_incharge').textContent = data.incharge_name || '-';
+        document.getElementById('tp_total_students').textContent = (data.tp_total_students || 0);
+        document.getElementById('tp_total_paid').textContent = (parseFloat(data.tp_total_paid || 0)).toFixed(2);
+
+        const status = data.verified || 'pending';
+        if (status === 'approved') document.getElementById('tp_status').textContent = '✔ Approved';
+        else if (status === 'rejected') document.getElementById('tp_status').textContent = '❌ Rejected';
+        else document.getElementById('tp_status').textContent = '⏳ Pending';
+
+        document.getElementById('tp_verified').textContent = data.verified_at || 'Not Available';
+
+        document.getElementById('modal_tp_id').value = data.id || '';
+        document.getElementById('modal_tp_id_rej').value = data.id || '';
+
+        var modalEl = document.getElementById('tpDetailsModal');
+        var bsModal = bootstrap.Modal.getOrCreateInstance(modalEl);
+        bsModal.show();
+    } catch (err) {
+        console.error(err);
+        alert('Unable to open details (data may be corrupted).');
+    }
+}
+</script>
+
+<style>
+.card-body .fw-semibold { font-size: 1.05rem; }
+.display-5 { font-size: 2.1rem; }
+.table td, .table th { padding: .9rem; vertical-align: middle; }
+</style>
+
+<?php
+// include footer and flush
+include __DIR__ . '/includes/footer.php';
+ob_end_flush();
+?>

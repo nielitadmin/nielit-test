@@ -1,0 +1,8 @@
+{
+  "require": {
+    "phpoffice/phpspreadsheet": "^1.30",
+    "vlucas/phpdotenv": "^5.5",
+    "razorpay/razorpay": "^2.9",
+    "phpmailer/phpmailer": "^7.0"
+  }
+}
